@@ -1,6 +1,6 @@
 /**
  * @title "The Overview Effect": Geological Lithology (ASTER)
- * @description High-contrast geological mapping using ASTER VNIR/SWIR.
+ * @description High-contrast geological mapping using ASTER VNIR/SWIR and Decorrelation Stretch (DCS).
  */
 
 // =========================================================
@@ -32,88 +32,176 @@ var region = ee.Geometry.Rectangle([
 ], proj, false).transform('EPSG:4326', 1);
 
 // =========================================================
-// 2. DATA PROCESSING
+// 2. HELPER FUNCTIONS (DCS)
+// =========================================================
+
+/**
+ * Applies a Decorrelation Stretch (DCS) to the specified bands.
+ * DCS enhances color separation by forcing the correlation between bands to zero.
+ * Structure: PCA -> Stretch -> Inverse PCA.
+ */
+function applyDCS(image, region, scale) {
+  var bandNames = image.bandNames();
+  
+  // 1. Mean Center the data
+  var meanDict = image.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: region,
+    scale: scale,
+    maxPixels: 1e9,
+    bestEffort: true
+  });
+  var centered = image.subtract(meanDict.toImage(bandNames));
+
+  // 2. Calculate Covariance Matrix
+  var covar = centered.toArray().reduceRegion({
+    reducer: ee.Reducer.covariance(),
+    geometry: region,
+    scale: scale,
+    maxPixels: 1e9,
+    bestEffort: true
+  });
+  
+  var covarArray = ee.Array(covar.get('array'));
+  
+  // 3. Compute Eigenvalues and Eigenvectors
+  var eigen = covarArray.eigen();
+  var eigenVectors = eigen.slice(1, 1); // The rotation matrix
+  var eigenValues = eigen.slice(1, 0, 1); // The variances
+  
+  // 4. Rotate Data to Principal Components (PCs)
+  var arrayImage = centered.toArray();
+  var principalComponents = eigenVectors.transpose().matrixMultiply(arrayImage.toArray(1));
+  
+  // 5. Stretch the PCs (Normalize by SD = sqrt(variance))
+  var sd = eigenValues.sqrt();
+  var scaledComponents = principalComponents.divide(sd);
+  
+  // 6. Rotate back to RGB space (Inverse Transform)
+  // For DCS, we rotate back so colors retain their original band identity meanings
+  var originalSpace = eigenVectors.matrixMultiply(scaledComponents);
+  
+  return originalSpace.arrayProject([0]).arrayFlatten([bandNames]);
+}
+
+// =========================================================
+// 3. DATA PROCESSING
 // =========================================================
 
 function addIndices(image) {
   // ASTER BAND MAPPING:
-  // VNIR (15m): B01 (Green/Yellow), B02 (Red), B3N (NIR)
-  // SWIR (30m): B04 (1.65), B05 (2.16), B06 (2.20), B07 (2.26), B08 (2.33), B09 (2.40)
+  // VNIR (15m): B01, B02, B3N
+  // SWIR (30m): B04, B05, B06, B07, B08, B09
+  // TIR  (90m): B10, B11, B12, B13, B14
   
   // 1. NDVI (Vegetation Masking)
-  // (NIR - Red) / (NIR + Red) -> (B3N - B02)
   var ndvi = image.normalizedDifference(['B3N', 'B02']).rename('NDVI');
   
   // 2. Iron Oxide (Gossan)
-  // Red / Green -> B02 / B01 (Classic ASTER ratio for iron)
-  var ironOxide = image.select('B02').divide(image.select('B01')).rename('Iron_Oxide');
+  var gossan = image.select('B04').divide(image.select('B02')).rename('Gossan_Index');
   
-  // 3. Lithology Indices (User Logic Translation)
+  // 3. Hydrothermal Alteration (SWIR RBDs)
+  // A. Phyllic (Sericite) -> (B5+B7)/B6
+  var phyllic = image.expression('(B5 + B7) / B6', {
+      'B5': image.select('B05'), 'B6': image.select('B06'), 'B7': image.select('B07')
+  }).rename('Phyllic_Alteration');
   
-  // A. Clay/Quartz (Green Channel)
-  // User used SWIR1/SWIR2. ASTER B04 (1.65) / B06 (2.20)
-  var clayIndex = image.select('B04').divide(image.select('B06')).rename('Clay_Quartz');
+  // B. Argillic (Alunite) -> (B4+B6)/B5
+  var argillic = image.expression('(B4 + B6) / B5', {
+      'B4': image.select('B04'), 'B5': image.select('B05'), 'B6': image.select('B06')
+  }).rename('Argillic_Alteration');
   
-  // B. Mafic/Ferrous (Red Channel)
-  // User used SWIR2/NIR. ASTER B06 (2.20) / B3N (NIR)
-  var ferrousIndex = image.select('B06').divide(image.select('B3N')).rename('Mafic_Ferrous');
-  
-  // C. Carbonate Proxy (Blue Channel)
-  // User used SWIR1/Red. ASTER B04 (1.65) / B02 (Red)
-  var carbonateIndex = image.select('B04').divide(image.select('B02')).rename('Carbonate_Proxy');
+  // C. Propylitic (Mg-OH) -> (B7+B9)/B8
+  var propylitic = image.expression('(B7 + B9) / B8', {
+      'B7': image.select('B07'), 'B8': image.select('B08'), 'B9': image.select('B09')
+  }).rename('Propylitic_Carbonate');
 
-  return image.addBands([ndvi, ironOxide, clayIndex, ferrousIndex, carbonateIndex]);
+  // 4. Lithology (TIR Ninomiya Indices)
+  // A. Quartz Index (QI) -> B11^2 / (B10*B12)
+  var quartz = image.expression('(B11 * B11) / (B10 * B12)', {
+      'B10': image.select('B10'), 'B11': image.select('B11'), 'B12': image.select('B12')
+  }).rename('Quartz_Index');
+
+  // B. Carbonate Index (CI) -> B13/B14
+  var carbonate = image.select('B13').divide(image.select('B14')).rename('Carbonate_Index');
+
+  // C. Mafic Index (MI) -> B12/B13
+  var mafic = image.select('B12').divide(image.select('B13')).rename('Mafic_Index');
+
+  return image.addBands([
+    ndvi, gossan, 
+    phyllic, argillic, propylitic, 
+    quartz, carbonate, mafic
+  ]);
 }
 
 var dataset = ee.ImageCollection('ASTER/AST_L1T_003')
   .filterBounds(point)
   .filterDate(config.start, config.end)
   .filter(ee.Filter.lt('CLOUDCOVER', config.cloudThresh))
-  .select(['B01', 'B02', 'B3N', 'B04', 'B05', 'B06', 'B07', 'B08', 'B09'])
+  .select(['B01', 'B02', 'B3N', 'B04', 'B05', 'B06', 'B07', 'B08', 'B09', 'B10', 'B11', 'B12', 'B13', 'B14'])
   .map(addIndices);
 
-// Use median (ASTER requires good filtering as it has artifacts)
 var img = dataset.median().clip(region);
 
 // =========================================================
-// 3. VEGETATION MASKING
+// 4. APPLY DECORRELATION STRETCH (DCS)
 // =========================================================
 
-// Mask where NDVI < 0.2 (ASTER NDVI is slightly different sensitivity)
+// Ref: Section 5.2 - Standard Lithology Composite (R=B14, G=B12, B=B10)
+var tirComposite = img.select(['B14', 'B12', 'B10']);
+
+// We apply DCS to this specific 3-band combination to enhance subtle emissivity differences.
+// Note: We use a larger scale (e.g., 90m or 100m) for covariance calculation to capture regional stats.
+var dcsImg = applyDCS(tirComposite, region, 90).rename(['DCS_R', 'DCS_G', 'DCS_B']);
+
+// =========================================================
+// 5. VEGETATION MASKING
+// =========================================================
+
 var rockMask = img.select('NDVI').lt(0.2); 
 var rockImg = img.updateMask(rockMask);
+var rockDCS = dcsImg.updateMask(rockMask);
 
 // =========================================================
-// 4. VISUALIZATION LAYERS
+// 6. VISUALIZATION LAYERS
 // =========================================================
 
-// --- Layer 1: False Color VNIR (Standard ASTER view) ---
-// B3N (NIR), B02 (Red), B01 (Green)
-var vnirVis = {
-  min: 20,
-  max: 180,
-  bands: ['B3N', 'B02', 'B01'], // NIR-Red-Green (Vegetation is Red)
+// --- Layer 1: Alteration Zones (SWIR) ---
+var alterationVis = {
+  min: 1.0,
+  max: [2.5, 2.0, 1.5],
+  bands: ['Phyllic_Alteration', 'Argillic_Alteration', 'Propylitic_Carbonate'],
   gamma: 1.2
 };
 
-// --- Layer 2: Iron Oxide ---
-var gossanVis = {
-  min: 1.0,
-  max: 3.0,
-  palette: ['000000', '440044', 'aa0000', 'ff8800', 'ffffaa'],
-  bands: ['Iron_Oxide']
+// --- Layer 2: Ninomiya Lithology (TIR Indices) ---
+var lithoVis = {
+  min: [0.8, 0.95, 1.0],
+  max: [1.1, 1.05, 1.05],
+  bands: ['Mafic_Index', 'Quartz_Index', 'Carbonate_Index'],
+  gamma: 1.5
 };
 
-// --- Layer 3: Lithology DCS ---
-var lithoVis = {
-  min: [0.5, 0.8, 0.5],
-  max: [1.5, 2.5, 3.5],
-  bands: ['Mafic_Ferrous', 'Clay_Quartz', 'Carbonate_Proxy'],
-  gamma: 1.4
+// --- Layer 3: Decorrelation Stretch (DCS) ---
+// DCS normalizes the bands, so the range is typically centered on 0 with SD units.
+// We visualize +/- 2.5 Standard Deviations.
+var dcsVis = {
+  min: -2.5,
+  max: 2.5,
+  bands: ['DCS_R', 'DCS_G', 'DCS_B'] // R=14(Carbonate/Quartz?), G=12(Mafic?), B=10
+};
+
+// --- Layer 4: Gossan ---
+var gossanVis = {
+  min: 1.5,
+  max: 3.5,
+  palette: ['000000', '440044', 'aa0000', 'ff8800', 'ffffaa'],
+  bands: ['Gossan_Index']
 };
 
 // =========================================================
-// 5. MAP OUTPUT
+// 7. MAP OUTPUT
 // =========================================================
 
 Map.centerObject(region, 13);
@@ -128,12 +216,20 @@ var outline = empty.paint({
 });
 Map.addLayer(outline, {palette: 'white'}, 'Export Frame (4:5)');
 
-Map.addLayer(img, vnirVis, 'ASTER VNIR False Color', true);
-Map.addLayer(rockImg.select('Iron_Oxide'), gossanVis, 'Iron Oxide Heatmap');
-Map.addLayer(rockImg, lithoVis, 'Lithology (R:Mafic, G:Clay, B:Carb)');
+// 1. Alteration (SWIR)
+Map.addLayer(rockImg, alterationVis, 'Hydrothermal Alteration (SWIR)', true);
+
+// 2. Lithology (TIR Indices)
+Map.addLayer(rockImg, lithoVis, 'Ninomiya Lithology (TIR Indices)', false);
+
+// 3. Lithology (DCS) - The new requested layer
+Map.addLayer(rockDCS, dcsVis, 'Decorrelation Stretch (TIR 14-12-10)', false);
+
+// 4. Gossan
+Map.addLayer(rockImg.select('Gossan_Index'), gossanVis, 'Gossan Heatmap', false);
 
 // =========================================================
-// 6. UI LEGEND
+// 8. UI LEGEND
 // =========================================================
 
 var panel = ui.Panel({
@@ -141,7 +237,7 @@ var panel = ui.Panel({
 });
 
 var title = ui.Label({
-  value: 'ASTER Lithology Guide',
+  value: 'ASTER Geology Guide',
   style: {fontWeight: 'bold', fontSize: '14px', color: 'white', backgroundColor: 'rgba(0,0,0,0)'}
 });
 panel.add(title);
@@ -161,23 +257,38 @@ var addLegendRow = function(color, label) {
   });
 };
 
-panel.add(addLegendRow('#FF0055', 'Mafic / Ferrous (B6/B3N)'));
-panel.add(addLegendRow('#00FF00', 'Clays / Quartz (B4/B6)'));
-panel.add(addLegendRow('#0055FF', 'Carbonates (B4/B2)'));
-panel.add(addLegendRow('#000000', 'Vegetation Masked'));
+panel.add(ui.Label({value:'SWIR Alteration', style:{color:'gray', fontSize:'10px', backgroundColor:'transparent'}}));
+panel.add(addLegendRow('#FF0000', 'Phyllic (Sericite)'));
+panel.add(addLegendRow('#00FF00', 'Argillic (Alunite/Clay)'));
+panel.add(addLegendRow('#0000FF', 'Propylitic (Chlorite)'));
+
+panel.add(ui.Label({value:'TIR DCS Interpretation', style:{color:'gray', fontSize:'10px', backgroundColor:'transparent'}}));
+panel.add(addLegendRow('#FF66CC', 'Quartz-Rich / Felsic (Red/Pink)'));
+panel.add(addLegendRow('#00FF00', 'Carbonates (Green)'));
+panel.add(addLegendRow('#6600CC', 'Mafic / Basalts (Purple)'));
 
 Map.add(panel);
 
 // =========================================================
-// 7. EXPORTS
+// 9. EXPORTS
 // =========================================================
 
 Export.image.toDrive({
-  image: rockImg.visualize(lithoVis),
-  description: 'ASTER_Lithology',
+  image: rockImg.visualize(alterationVis),
+  description: 'ASTER_Alteration_Map',
   folder: 'EarthEngineExports',
-  fileNamePrefix: 'ASTER_Lithology_DCS',
+  fileNamePrefix: 'ASTER_Alteration_RBD',
   region: region,
-  scale: 15, // Export at best resolution (VNIR)
+  scale: 15,
+  maxPixels: 1e9
+});
+
+Export.image.toDrive({
+  image: rockDCS.visualize(dcsVis),
+  description: 'ASTER_Lithology_DCS',
+  folder: 'EarthEngineExports',
+  fileNamePrefix: 'ASTER_Lithology_DCS_141210',
+  region: region,
+  scale: 15, 
   maxPixels: 1e9
 });
