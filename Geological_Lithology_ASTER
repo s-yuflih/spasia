@@ -1,0 +1,183 @@
+/**
+ * @title "The Overview Effect": Geological Lithology (ASTER)
+ * @description High-contrast geological mapping using ASTER VNIR/SWIR.
+ */
+
+// =========================================================
+// 1. CONFIGURATION
+// =========================================================
+
+var config = {
+  // ASTER has a vast archive.
+  start: '2000-01-01',
+  end: '2007-12-31',
+  
+  // Cloud Threshold (Relies on metadata)
+  cloudThresh: 20
+};
+
+var point = geometry;
+
+var proj = 'EPSG:3857';
+var center = point.transform(proj, 1).coordinates();
+var x = ee.Number(center.get(0));
+var y = ee.Number(center.get(1));
+
+var halfWidth = 2000;
+var halfHeight = 2500;
+
+var region = ee.Geometry.Rectangle([
+  x.subtract(halfWidth), y.subtract(halfHeight),
+  x.add(halfWidth), y.add(halfHeight)
+], proj, false).transform('EPSG:4326', 1);
+
+// =========================================================
+// 2. DATA PROCESSING
+// =========================================================
+
+function addIndices(image) {
+  // ASTER BAND MAPPING:
+  // VNIR (15m): B01 (Green/Yellow), B02 (Red), B3N (NIR)
+  // SWIR (30m): B04 (1.65), B05 (2.16), B06 (2.20), B07 (2.26), B08 (2.33), B09 (2.40)
+  
+  // 1. NDVI (Vegetation Masking)
+  // (NIR - Red) / (NIR + Red) -> (B3N - B02)
+  var ndvi = image.normalizedDifference(['B3N', 'B02']).rename('NDVI');
+  
+  // 2. Iron Oxide (Gossan)
+  // Red / Green -> B02 / B01 (Classic ASTER ratio for iron)
+  var ironOxide = image.select('B02').divide(image.select('B01')).rename('Iron_Oxide');
+  
+  // 3. Lithology Indices (User Logic Translation)
+  
+  // A. Clay/Quartz (Green Channel)
+  // User used SWIR1/SWIR2. ASTER B04 (1.65) / B06 (2.20)
+  var clayIndex = image.select('B04').divide(image.select('B06')).rename('Clay_Quartz');
+  
+  // B. Mafic/Ferrous (Red Channel)
+  // User used SWIR2/NIR. ASTER B06 (2.20) / B3N (NIR)
+  var ferrousIndex = image.select('B06').divide(image.select('B3N')).rename('Mafic_Ferrous');
+  
+  // C. Carbonate Proxy (Blue Channel)
+  // User used SWIR1/Red. ASTER B04 (1.65) / B02 (Red)
+  var carbonateIndex = image.select('B04').divide(image.select('B02')).rename('Carbonate_Proxy');
+
+  return image.addBands([ndvi, ironOxide, clayIndex, ferrousIndex, carbonateIndex]);
+}
+
+var dataset = ee.ImageCollection('ASTER/AST_L1T_003')
+  .filterBounds(point)
+  .filterDate(config.start, config.end)
+  .filter(ee.Filter.lt('CLOUDCOVER', config.cloudThresh))
+  .select(['B01', 'B02', 'B3N', 'B04', 'B05', 'B06', 'B07', 'B08', 'B09'])
+  .map(addIndices);
+
+// Use median (ASTER requires good filtering as it has artifacts)
+var img = dataset.median().clip(region);
+
+// =========================================================
+// 3. VEGETATION MASKING
+// =========================================================
+
+// Mask where NDVI < 0.2 (ASTER NDVI is slightly different sensitivity)
+var rockMask = img.select('NDVI').lt(0.2); 
+var rockImg = img.updateMask(rockMask);
+
+// =========================================================
+// 4. VISUALIZATION LAYERS
+// =========================================================
+
+// --- Layer 1: False Color VNIR (Standard ASTER view) ---
+// B3N (NIR), B02 (Red), B01 (Green)
+var vnirVis = {
+  min: 20,
+  max: 180,
+  bands: ['B3N', 'B02', 'B01'], // NIR-Red-Green (Vegetation is Red)
+  gamma: 1.2
+};
+
+// --- Layer 2: Iron Oxide ---
+var gossanVis = {
+  min: 1.0,
+  max: 3.0,
+  palette: ['000000', '440044', 'aa0000', 'ff8800', 'ffffaa'],
+  bands: ['Iron_Oxide']
+};
+
+// --- Layer 3: Lithology DCS ---
+var lithoVis = {
+  min: [0.5, 0.8, 0.5],
+  max: [1.5, 2.5, 3.5],
+  bands: ['Mafic_Ferrous', 'Clay_Quartz', 'Carbonate_Proxy'],
+  gamma: 1.4
+};
+
+// =========================================================
+// 5. MAP OUTPUT
+// =========================================================
+
+Map.centerObject(region, 13);
+Map.setOptions('HYBRID');
+
+// Boundary
+var empty = ee.Image().byte();
+var outline = empty.paint({
+  featureCollection: ee.FeatureCollection(region),
+  color: 1,
+  width: 3
+});
+Map.addLayer(outline, {palette: 'white'}, 'Export Frame (4:5)');
+
+Map.addLayer(img, vnirVis, 'ASTER VNIR False Color', true);
+Map.addLayer(rockImg.select('Iron_Oxide'), gossanVis, 'Iron Oxide Heatmap');
+Map.addLayer(rockImg, lithoVis, 'Lithology (R:Mafic, G:Clay, B:Carb)');
+
+// =========================================================
+// 6. UI LEGEND
+// =========================================================
+
+var panel = ui.Panel({
+  style: {position: 'bottom-left', padding: '8px 15px', backgroundColor: 'rgba(0,0,0,0.8)'}
+});
+
+var title = ui.Label({
+  value: 'ASTER Lithology Guide',
+  style: {fontWeight: 'bold', fontSize: '14px', color: 'white', backgroundColor: 'rgba(0,0,0,0)'}
+});
+panel.add(title);
+
+var addLegendRow = function(color, label) {
+  var box = ui.Label({
+    style: {backgroundColor: color, padding: '8px', margin: '0 4px 4px 0'}
+  });
+  var lbl = ui.Label({
+    value: label,
+    style: {color: 'white', backgroundColor: 'rgba(0,0,0,0)'}
+  });
+  return ui.Panel({
+    widgets: [box, lbl],
+    layout: ui.Panel.Layout.Flow('horizontal'),
+    style: {backgroundColor: 'rgba(0,0,0,0)'}
+  });
+};
+
+panel.add(addLegendRow('#FF0055', 'Mafic / Ferrous (B6/B3N)'));
+panel.add(addLegendRow('#00FF00', 'Clays / Quartz (B4/B6)'));
+panel.add(addLegendRow('#0055FF', 'Carbonates (B4/B2)'));
+panel.add(addLegendRow('#000000', 'Vegetation Masked'));
+
+Map.add(panel);
+
+// =========================================================
+// 7. EXPORTS
+// =========================================================
+
+Export.image.toDrive({
+  image: rockImg.visualize(lithoVis),
+  description: 'ASTER_Lithology',
+  folder: 'EarthEngineExports',
+  fileNamePrefix: 'ASTER_Lithology_DCS',
+  region: region,
+  scale: 15, // Export at best resolution (VNIR)
+  maxPixels: 1e9
+});
