@@ -13,18 +13,18 @@ var config = {
   end: '2007-12-31',
   
   // Cloud Threshold (Relies on metadata)
-  cloudThresh: 20
+  cloudThresh: 10
 };
 
-var point = geometry;
+var point = typeof geometry !== 'undefined' ? geometry : ee.Geometry.Point([0, 0]);
 
 var proj = 'EPSG:3857';
 var center = point.transform(proj, 1).coordinates();
 var x = ee.Number(center.get(0));
 var y = ee.Number(center.get(1));
 
-var halfWidth = 2000;
-var halfHeight = 2500;
+var halfWidth = 4000;
+var halfHeight = 5000;
 
 var region = ee.Geometry.Rectangle([
   x.subtract(halfWidth), y.subtract(halfHeight),
@@ -64,23 +64,36 @@ function applyDCS(image, region, scale) {
   
   var covarArray = ee.Array(covar.get('array'));
   
-  // 3. Compute Eigenvalues and Eigenvectors
+  // 3. Compute Eigenvalues and Eigenvectors (ee.Array operations)
   var eigen = covarArray.eigen();
-  var eigenVectors = eigen.slice(1, 1); // The rotation matrix
-  var eigenValues = eigen.slice(1, 0, 1); // The variances
+  var eigenValues = eigen.slice(1, 0, 1); // First column (variances)
+  var eigenVectors = eigen.slice(1, 1);   // Remaining columns (rotation matrix)
   
-  // 4. Rotate Data to Principal Components (PCs)
-  var arrayImage = centered.toArray();
-  var principalComponents = eigenVectors.transpose().matrixMultiply(arrayImage.toArray(1));
+  // FIX: Transpose the rotation matrix HERE (on the ee.Array), not on the image
+  // We project TO PC space: PCs = E_transpose * Data
+  var rotationMatrix = eigenVectors.transpose();
   
-  // 5. Stretch the PCs (Normalize by SD = sqrt(variance))
-  var sd = eigenValues.sqrt();
-  var scaledComponents = principalComponents.divide(sd);
+  // 4. Convert Arrays to Constant Images for Matrix Math
+  var rotationImg = ee.Image(rotationMatrix); 
+  var inverseRotationImg = ee.Image(eigenVectors); // For the way back, we use E (not transposed)
+  var sdImg = ee.Image(eigenValues).sqrt();
   
-  // 6. Rotate back to RGB space (Inverse Transform)
-  // For DCS, we rotate back so colors retain their original band identity meanings
-  var originalSpace = eigenVectors.matrixMultiply(scaledComponents);
+  // 5. Prepare Data Image (Make it a 2D column vector: bands x 1)
+  var arrayImage = centered.toArray().toArray(1);
   
+  // 6. Rotate Data to Principal Components (PCs)
+  // [bands x bands] * [bands x 1] = [bands x 1]
+  var principalComponents = rotationImg.matrixMultiply(arrayImage);
+  
+  // 7. Stretch the PCs (Normalize by SD)
+  var scaledComponents = principalComponents.divide(sdImg);
+  
+  // 8. Rotate back to RGB space (Inverse Transform)
+  // Original = E * Scaled
+  var originalSpace = inverseRotationImg.matrixMultiply(scaledComponents);
+  
+  // 9. Flatten back to bands
+  // Project [bands x 1] -> [bands] -> flatten to scalar bands
   return originalSpace.arrayProject([0]).arrayFlatten([bandNames]);
 }
 
@@ -167,6 +180,16 @@ var rockDCS = dcsImg.updateMask(rockMask);
 // 6. VISUALIZATION LAYERS
 // =========================================================
 
+// --- Layer 0: VNIR False Color (The "Base" Layer) ---
+// ASTER lacks a Blue band. Standard "Natural-like" view is 3N-2-1 (Infrared).
+// Vegetation = Red, Urban = Cyan/Grey.
+var baseVis = {
+  min: 20,
+  max: 180,
+  bands: ['B3N', 'B02', 'B01'],
+  gamma: 1.2
+};
+
 // --- Layer 1: Alteration Zones (SWIR) ---
 var alterationVis = {
   min: 1.0,
@@ -216,8 +239,11 @@ var outline = empty.paint({
 });
 Map.addLayer(outline, {palette: 'white'}, 'Export Frame (4:5)');
 
+// 0. Base: VNIR False Color
+Map.addLayer(img, baseVis, 'VNIR Base (False Color)', true);
+
 // 1. Alteration (SWIR)
-Map.addLayer(rockImg, alterationVis, 'Hydrothermal Alteration (SWIR)', true);
+Map.addLayer(rockImg, alterationVis, 'Hydrothermal Alteration (SWIR)', false);
 
 // 2. Lithology (TIR Indices)
 Map.addLayer(rockImg, lithoVis, 'Ninomiya Lithology (TIR Indices)', false);
@@ -257,12 +283,12 @@ var addLegendRow = function(color, label) {
   });
 };
 
-panel.add(ui.Label({value:'SWIR Alteration', style:{color:'gray', fontSize:'10px', backgroundColor:'transparent'}}));
+panel.add(ui.Label({value:'SWIR Alteration', style:{color:'gray', fontSize:'10px', backgroundColor:'#000000'}}));
 panel.add(addLegendRow('#FF0000', 'Phyllic (Sericite)'));
 panel.add(addLegendRow('#00FF00', 'Argillic (Alunite/Clay)'));
 panel.add(addLegendRow('#0000FF', 'Propylitic (Chlorite)'));
 
-panel.add(ui.Label({value:'TIR DCS Interpretation', style:{color:'gray', fontSize:'10px', backgroundColor:'transparent'}}));
+panel.add(ui.Label({value:'TIR DCS Interpretation', style:{color:'gray', fontSize:'10px', backgroundColor:'#000000'}}));
 panel.add(addLegendRow('#FF66CC', 'Quartz-Rich / Felsic (Red/Pink)'));
 panel.add(addLegendRow('#00FF00', 'Carbonates (Green)'));
 panel.add(addLegendRow('#6600CC', 'Mafic / Basalts (Purple)'));
