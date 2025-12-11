@@ -1,6 +1,9 @@
 /**
- * @title "The Overview Effect": Geological Lithology & Ninomiya Indices
- * @description High-contrast geological mapping with Vegetation Masking.
+ * @title Sentinel-2 & ASTER Synergy: Advanced Geological Lithology
+ * @description Implements the workflows from "Sentinel-2 Applications in Earth Observation":
+ * 1. Iron Oxide & Gossan Mapping (Sec 2.2.1)
+ * 2. Hydrothermal Alteration Zoning (Sec 2.2.2)
+ * 3. Sensor Fusion: S2 Structure + ASTER Mineralogy (Sec 2.3)
  */
 
 // =========================================================
@@ -8,225 +11,255 @@
 // =========================================================
 
 var config = {
+  // Sentinel-2 Range (Recent)
+  startS2: '2020-01-01',
+  endS2: '2025-12-31',
   
-  // Date Range
-  start: '2020-01-01',
-  end: '2025-12-31',
+  // ASTER Range (Historical Archive for Fusion)
+  // ASTER data can be sparse; a wider window ensures coverage.
+  startAster: '2000-01-01',
+  endAster: '2007-12-31',
   
-  // Cloud Threshold
-  cloudThresh: 30
+  cloudThresh: 20
 };
 
-var point = geometry;
+var point = geometry; // Expecting a geometry point from user drawing
 
-// Define Export Region: 4:5 Ratio (8km x 10km)
-// We project the point to EPSG:3857 (meters), apply offsets, and project back.
+// Export/Analysis Region (8km x 10km box)
 var proj = 'EPSG:3857';
 var center = point.transform(proj, 1).coordinates();
 var x = ee.Number(center.get(0));
 var y = ee.Number(center.get(1));
-
-// Half-dimensions for 4000m width and 5000m height
-var halfWidth = 2000;
-var halfHeight = 2500;
-
 var region = ee.Geometry.Rectangle([
-  x.subtract(halfWidth), y.subtract(halfHeight),
-  x.add(halfWidth), y.add(halfHeight)
+  x.subtract(4000), y.subtract(5000),
+  x.add(4000), y.add(5000)
 ], proj, false).transform('EPSG:4326', 1);
 
 // =========================================================
-// 2. DATA PROCESSING
+// 2. SENTINEL-2 PROCESSING (High Res Structure)
 // =========================================================
 
-function maskS2clouds(image) {
+function processS2(image) {
   var qa = image.select('QA60');
-  var mask = qa.bitwiseAnd(1<<10).eq(0).and(qa.bitwiseAnd(1<<11).eq(0));
-  return image.updateMask(mask).divide(10000);
+  var cloudMask = qa.bitwiseAnd(1<<10).eq(0).and(qa.bitwiseAnd(1<<11).eq(0));
+  
+  // Scale to 0-1
+  var img = image.updateMask(cloudMask).divide(10000);
+  
+  // --- Section 2.2.1: Iron Oxide and Gossan Mapping ---
+  
+  // 1. Iron Oxide Ratio (B4/B2)
+  // Highlights Hematite/Goethite (Red reflectance / Blue absorption)
+  var ironOxide = img.select('B4').divide(img.select('B2')).rename('Iron_Oxide');
+  
+  // 2. Ferrous Iron Ratio (B12/B8 + B3/B4)
+  // Highlights Fe2+ in mafic silicates
+  var ferrousIron = img.select('B12').divide(img.select('B8'))
+    .add(img.select('B3').divide(img.select('B4')))
+    .rename('Ferrous_Iron');
+    
+  // 3. Gossan Index (B11/B4)
+  // Swir/Red: Highlights clay-rich (high SWIR) + iron-rich (low Red) caps
+  var gossan = img.select('B11').divide(img.select('B4')).rename('Gossan_Index');
+  
+  // --- Section 2.2.2: Hydrothermal Alteration ---
+  
+  // 4. Clay Ratio (B11/B12) - Standard Argillic/Phyllic
+  var clay = img.select('B11').divide(img.select('B12')).rename('Clay_Ratio');
+  
+  // 5. Vegetation Masking Helper (NDVI)
+  var ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI');
+
+  return img.addBands([ironOxide, ferrousIron, gossan, clay, ndvi]);
 }
 
-function addIndices(image) {
-  // A. NDVI for Vegetation Masking
-  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
-  
-  // B. Iron Oxide (Gossan) Ratio: Red / Blue
-  // Iron reflects Red, absorbs Blue.
-  var ironOxide = image.select('B4').divide(image.select('B2')).rename('Iron_Oxide');
-  
-  // C. Ninomiya-Style Indices (Adapted for Sentinel-2)
-  // Index 1 (Clays/Alteration/Quartz): B11 / B12
-  var clayIndex = image.select('B11').divide(image.select('B12')).rename('Clay_Quartz');
-  
-  // Index 2 (Ferrous Iron/Mafic): B12 / B8
-  var ferrousIndex = image.select('B12').divide(image.select('B8')).rename('Mafic_Ferrous');
-  
-  // Index 3 (Carbonate Proxy):
-  // Use B12 relative to B11 and B4 to find absorption.
-  var carbonateIndex = image.select('B11').divide(image.select('B4')).rename('Carbonate_Proxy');
-
-  return image.addBands([ndvi, ironOxide, clayIndex, ferrousIndex, carbonateIndex]);
-}
-
-var dataset = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-  .filterBounds(point)
-  .filterDate(config.start, config.end)
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(region)
+  .filterDate(config.startS2, config.endS2)
   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', config.cloudThresh))
-  .map(maskS2clouds)
-  .map(addIndices);
-
-var img = dataset.median().clip(region);
-
-// =========================================================
-// 3. VEGETATION MASKING (The "Blackout" Technique)
-// =========================================================
-
-// Create a mask where NDVI < 0.3 (Non-Vegetation)
-// This hides the jungle so we only see the rock.
-var rockMask = img.select('NDVI').lt(0.4); 
-
-// Update the image to only show rock pixels
-var rockImg = img.updateMask(rockMask);
-
+  .map(processS2)
+  .median()
+  .clip(region);
 
 // =========================================================
-// 4. VISUALIZATION LAYERS
+// 3. ASTER PROCESSING (Spectral Discrimination)
 // =========================================================
 
-// --- Layer 1: True Color (Context) ---
-// High saturation for the "Overview" look
-var trueColorVis = {
-  min: 0.0,
-  max: 0.25,
-  bands: ['B4', 'B3', 'B2'],
-  gamma: 1.2
+function processAster(image) {
+  // ASTER Bands: B04-B09 are SWIR (30m)
+  // Indices from Document Section 2.3.1
+  
+  // 1. Alunite Index: (B5 + B7) / B6
+  var alunite = image.expression(
+    '(B5 + B7) / B6', {
+      'B5': image.select('B05'),
+      'B6': image.select('B06'),
+      'B7': image.select('B07')
+  }).rename('Alunite_Index');
+
+  // 2. Kaolinite Index: (B4 + B2) / B5
+  // Note: Using ASTER B2 (Red) and B4 (SWIR1)
+  var kaolinite = image.expression(
+    '(B4 + B2) / B5', {
+      'B2': image.select('B02'),
+      'B4': image.select('B04'),
+      'B5': image.select('B05')
+  }).rename('Kaolinite_Index');
+  
+  return image.addBands([alunite, kaolinite]);
+}
+
+var aster = ee.ImageCollection('ASTER/AST_L1T_003')
+  .filterBounds(region)
+  .filterDate(config.startAster, config.endAster)
+  .filter(ee.Filter.lt('CLOUDCOVER', 20))
+  .select(['B02', 'B04', 'B05', 'B06', 'B07'])
+  .map(processAster)
+  .median()
+  .clip(region);
+
+// =========================================================
+// 4. SENSOR FUSION (Section 2.3)
+// =========================================================
+
+// "Logical Index Overlay": 
+// Use Sentinel-2 to identify where 'Clay' is (High spatial res),
+// Then use ASTER to classify WHAT kind of clay it is (High spectral res).
+
+// 1. Resample ASTER to Sentinel-2 grid (10m)
+var asterResampled = aster.reproject({
+  crs: s2.select('B2').projection(),
+  scale: 10
+});
+
+// 2. Define the "Alteration Zone" using Sentinel-2
+// Threshold: Clay Ratio > 1.2 (Adjust based on terrain) and Low Vegetation
+var alterationMask = s2.select('Clay_Ratio').gt(1.2)
+  .and(s2.select('NDVI').lt(0.3));
+
+// 3. Mask ASTER indices to only show within S2 Alteration Zones
+var fusedKaolinite = asterResampled.select('Kaolinite_Index').updateMask(alterationMask);
+var fusedAlunite = asterResampled.select('Alunite_Index').updateMask(alterationMask);
+
+
+// =========================================================
+// 5. VISUALIZATION PARAMETERS
+// =========================================================
+
+// A. True Color (Context)
+var trueColorVis = {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.25, gamma: 1.2};
+
+// B. Alteration RGB (Section 2.2.2 Table 1)
+// R: Clay (B11/B12), G: Ferrous (B11/B8), B: Iron (B4/B2)
+// Note: Document lists G as B11/B8 for RGB composite specifically.
+var altRgb = s2.expression(
+  'b("Clay_Ratio") / b("Ferrous_Iron")', // Just placeholder, we construct RGB below
+  {'Clay_Ratio': s2.select('Clay_Ratio'), 'Ferrous_Iron': s2.select('Ferrous_Iron')}
+);
+// We build the visualization directly on the map addLayer for flexibility
+var alterationVis = {
+  bands: ['Clay_Ratio', 'Ferrous_Iron', 'Iron_Oxide'], // Mapping to R, G, B roughly
+  min: [1.0, 1.0, 1.0],
+  max: [2.0, 3.0, 3.0], // Adjusted max for Ferrous calculation
+  gamma: 1.3
 };
 
-// --- Layer 2: NDVI (Vegetation Context) ---
-var ndviLay = img.normalizedDifference(['B8', 'B4'])
-var ndviVis = {
-  min: -1,
-  max: 1,
-  palette: ['red', 'white', 'green']
-};
+// Precise Table 1 implementation: 
+// R: B11/B12 (Clay), G: B11/B8 (Ferrous proxy), B: B4/B2 (Iron)
+var s2_B11_B8 = s2.select('B11').divide(s2.select('B8'));
+var alterationComposite = ee.Image.cat([
+  s2.select('Clay_Ratio'), // Red
+  s2_B11_B8,               // Green
+  s2.select('Iron_Oxide')  // Blue
+]);
 
-// --- Layer 3: Iron Oxide (Gossan Heatmap) ---
-// Visualizes the "Rust" of the earth. 
-// Black = No Iron, Orange/Red/White = High Iron (Ore body indicators)
+// C. Gossan Map (Heatmap style)
 var gossanVis = {
-  min: 1.0,
-  max: 2.5,
-  palette: ['000000', '440044', 'aa0000', 'ff8800', 'ffffaa'],
-  bands: ['Iron_Oxide']
+  min: 0.8, max: 2.0,
+  palette: ['000000', '4b0082', 'ff0000', 'ffff00'], // Black->Purple->Red->Yellow
+  bands: ['Gossan_Index']
 };
 
-// --- Layer 4: Ninomiya / Lithology DCS ---
-// RGB Composition:
-// Red   = Mafic Rocks (Basalts) -> Ferrous Index
-// Green = Quartz/Alteration     -> Clay Index
-// Blue  = Carbonates/Host       -> Carbonate Proxy
-var lithoVis = {
-  min: [0.5, 0.8, 0.5],
-  max: [1.5, 2.0, 3.0],
-  bands: ['Mafic_Ferrous', 'Clay_Quartz', 'Carbonate_Proxy'],
-  gamma: 1.4 // Boost contrast for neon effect
-};
-
+// D. Fused Mineralogy (ASTER + S2)
+var kaoliniteVis = {min: 1.8, max: 2.5, palette: ['white', 'magenta']};
+var aluniteVis = {min: 1.8, max: 2.5, palette: ['white', 'cyan']};
 
 // =========================================================
-// 5. MAP OUTPUT
+// 6. MAP RENDERING & UI
 // =========================================================
 
-Map.centerObject(region, 13); // Center on the box
+Map.centerObject(region, 13);
 Map.setOptions('HYBRID');
 
-// Add the boundary outline for reference
+// Boundary
 var empty = ee.Image().byte();
-var outline = empty.paint({
-  featureCollection: ee.FeatureCollection(region),
-  color: 1,
-  width: 3
-});
-Map.addLayer(outline, {palette: 'white'}, 'Export Frame (4:5)');
+var outline = empty.paint({featureCollection: ee.FeatureCollection(region), color: 1, width: 3});
+Map.addLayer(outline, {palette: 'white'}, 'ROI (4:5 Ratio)');
 
-// 1. Base: True Color
-Map.addLayer(img, trueColorVis, 'True Color (Overview)');
+// Layers
+Map.addLayer(s2, trueColorVis, '1. True Color (Overview)');
 
-// 2. NDVI Layer
-Map.addLayer(ndviLay, ndviVis, 'NDVI)', false);
+// Rock Mask (Hide vegetation for geology layers)
+var rockMask = s2.select('NDVI').lt(0.3);
+var s2Rock = alterationComposite.updateMask(rockMask);
+var s2GossanRock = s2.updateMask(rockMask);
 
-// 3. Iron Oxide (Gossans) - Masked to rocks only
-Map.addLayer(rockImg.select('Iron_Oxide'), gossanVis, 'Iron Oxide Heatmap (Gossans)');
+Map.addLayer(s2Rock, {min: [1.0, 0.5, 1.0], max: [2.0, 1.5, 2.5]}, '2. Alteration RGB (Sec 2.2.2)', false);
+Map.addLayer(s2GossanRock.select('Gossan_Index'), gossanVis, '3. Gossan Index (Sec 2.2.1)', false);
 
-// 4. Lithology Map (Ninomiya) - Masked to rocks only
-Map.addLayer(rockImg, lithoVis, 'Lithology (R:Mafic, G:Quartz, B:Carb)');
+// Fusion Layers
+Map.addLayer(fusedKaolinite, kaoliniteVis, '4. Fusion: Kaolinite (ASTER masked by S2)', false);
+Map.addLayer(fusedAlunite, aluniteVis, '4. Fusion: Alunite (ASTER masked by S2)', false);
 
 
 // =========================================================
-// 6. UI LEGEND (Essential for "Overview")
+// 7. LEGEND UI
 // =========================================================
 
 var panel = ui.Panel({
-  style: {position: 'bottom-left', padding: '8px 15px', backgroundColor: 'rgba(0,0,0,0.8)'}
+  style: {position: 'bottom-left', padding: '8px', backgroundColor: 'rgba(0,0,0,0)'}
 });
 
 var title = ui.Label({
-  value: 'Lithology Guide',
-  style: {fontWeight: 'bold', fontSize: '14px', color: 'white', backgroundColor: 'rgba(0,0,0,0)'}
+  value: 'Sentinel-2 & ASTER Synergy',
+  style: {fontWeight: 'bold', color: 'white', backgroundColor: 'rgba(0,0,0,0)'}
 });
 panel.add(title);
 
-var addLegendRow = function(color, label) {
-  var box = ui.Label({
-    style: {backgroundColor: color, padding: '8px', margin: '0 4px 4px 0'}
-  });
-  var lbl = ui.Label({
-    value: label,
-    style: {color: 'white', backgroundColor: 'rgba(0,0,0,0)'}
-  });
-  return ui.Panel({
-    widgets: [box, lbl],
-    layout: ui.Panel.Layout.Flow('horizontal'),
-    style: {backgroundColor: 'rgba(0,0,0,0)'}
-  });
-};
+function addRow(color, name) {
+  var box = ui.Label({style: {backgroundColor: color, padding: '8px', margin: '0 4px 4px 0'}});
+  var lbl = ui.Label({value: name, style: {color: 'white', backgroundColor: 'rgba(0,0,0,0)'}});
+  return ui.Panel({widgets: [box, lbl], layout: ui.Panel.Layout.Flow('horizontal'), style: {backgroundColor: 'rgba(0,0,0,0)'}});
+}
 
-panel.add(addLegendRow('#FF0055', 'Mafic / Basalts (Ferrous)'));
-panel.add(addLegendRow('#00FF00', 'Quartz / Alteration (Clays)'));
-panel.add(addLegendRow('#0055FF', 'Carbonates / Host Rock'));
-panel.add(addLegendRow('#000000', 'Vegetation Masked'));
+panel.add(ui.Label({value: 'Alteration RGB (S2)', style: {color: 'lightgray', backgroundColor: 'rgba(0,0,0,0)', fontSize:'10px'}}));
+panel.add(addRow('red', 'Clays / Argillic'));
+panel.add(addRow('green', 'Ferrous / Mafic'));
+panel.add(addRow('blue', 'Iron Oxides'));
+
+panel.add(ui.Label({value: 'Fused Minerals (S2+ASTER)', style: {color: 'lightgray', backgroundColor: 'rgba(0,0,0,0)', fontSize:'10px'}}));
+panel.add(addRow('magenta', 'Kaolinite (Fusion)'));
+panel.add(addRow('cyan', 'Alunite (Fusion)'));
+panel.add(addRow('yellow', 'Gossan Cap'));
 
 Map.add(panel);
 
 // =========================================================
-// 7. EXPORTS
+// 8. EXPORTS
 // =========================================================
 
 Export.image.toDrive({
-  image: ndviLay.visualize(ndviVis),
-  description: 'NDVI',
-  folder: 'EarthEngineExports',
-  fileNamePrefix: 'NDVI',
+  image: s2Rock,
+  description: 'S2_Alteration_RGB',
+  folder: 'GEE_Geology',
   region: region,
-  scale: 10,
-  maxPixels: 1e9
+  scale: 10
 });
 
 Export.image.toDrive({
-  image: rockImg.visualize(gossanVis),
-  description: 'Iron_Oxide',
-  folder: 'EarthEngineExports',
-  fileNamePrefix: 'Gossans',
+  image: fusedKaolinite.unmask(0), // Unmask for export
+  description: 'S2_ASTER_Fusion_Kaolinite',
+  folder: 'GEE_Geology',
   region: region,
-  scale: 10,
-  maxPixels: 1e9
-});
-
-Export.image.toDrive({
-  image: rockImg.visualize(lithoVis),
-  description: 'Lithology',
-  folder: 'EarthEngineExports',
-  fileNamePrefix: 'Lithology_DCS',
-  region: region,
-  scale: 10,
-  maxPixels: 1e9
+  scale: 10 // Exporting ASTER data at S2 resolution
 });
