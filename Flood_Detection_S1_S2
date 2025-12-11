@@ -1,0 +1,183 @@
+/**
+ * @title Flood Detection & Risk: S1/S2 Sensor Fusion
+ * @description Implements Sec 5 of "Sentinel-2 Applications":
+ * 1. Flood Extent: S1 SAR (Cloud Penetrating) + S2 Validation (Sec 5.1)
+ * 2. Flood Risk: Historical Water Frequency Mapping (Sec 5.2)
+ */
+
+// =========================================================
+// 1. CONFIGURATION
+// =========================================================
+
+var config = {
+  // Event: Example Flood (e.g., Pakistan 2022 or generic recent)
+  // Adjust these dates to capture a specific flood event in your ROI
+  eventStart: '2022-08-15',
+  eventEnd: '2022-09-15',
+  
+  // Historical Baseline (For Risk/Frequency Mapping)
+  historyStart: '2018-01-01',
+  historyEnd: '2022-01-01',
+  
+  // Thresholds
+  s1Threshold: -18, // VH dB value for water (Sec 5.1.1)
+  s2CloudThresh: 50
+};
+
+// Default Region: Indus River Basin (Generic Example)
+// If user draws a polygon, use that instead.
+var point = typeof geometry !== 'undefined' ? geometry : ee.Geometry.Point([67.9, 26.4]); 
+var region = point.buffer(15000).bounds();
+Map.centerObject(region, 11);
+
+// =========================================================
+// 2. SENTINEL-1 FLOOD EXTENT (ACTIVE SENSING) - SEC 5.1
+// =========================================================
+
+// SAR is critical because floods usually occur under cloud cover.
+function processS1(image) {
+  // Speckle Filtering (Refined Lee or Boxcar for speed)
+  var smooth = image.focal_median(30, 'circle', 'meters');
+  return image.addBands(smooth, null, true);
+}
+
+var s1Col = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(region)
+  .filterDate(config.eventStart, config.eventEnd)
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .map(processS1)
+  .select('VH'); // VH is generally better for water/land contrast
+
+// 1. Detect Flood Water (SAR)
+var s1FloodImage = s1Col.min().clip(region); // 'Min' composite captures the darkest (water) pixels during event
+var s1WaterMask = s1FloodImage.lt(config.s1Threshold).selfMask().rename('SAR_Flood_Extent');
+
+// =========================================================
+// 3. SENTINEL-2 CONTEXT & VALIDATION - SEC 5.1.1
+// =========================================================
+
+function calcMNDWI(image) {
+  var mndwi = image.normalizedDifference(['B3', 'B11']).rename('MNDWI');
+  return image.addBands(mndwi);
+}
+
+// 2. Pre-Event Baseline (What was there before?)
+// Used to subtract permanent water and identify impacted land cover.
+var s2Pre = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(region)
+  .filterDate(config.historyStart, config.historyEnd) // Long baseline
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .map(calcMNDWI)
+  .median()
+  .clip(region);
+
+// Permanent Water Mask (MNDWI > 0.1 normally)
+var permWater = s2Pre.select('MNDWI').gt(0.1).selfMask().rename('Permanent_Water');
+
+// 3. Fuse: Actual Flood = (SAR Detection) MINUS (Permanent Water)
+var actualFlood = s1WaterMask.updateMask(permWater.unmask().not());
+
+// =========================================================
+// 4. FLOOD RECURRENCE & FREQUENCY (RISK) - SEC 5.2
+// =========================================================
+
+// "Water Occurrence Frequency" = (Water Detections / Total Valid Obs)
+// This maps the "Flood Hazard Zones" (Sec 5.2)
+
+var s2History = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(region)
+  .filterDate(config.historyStart, config.historyEnd)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 50));
+
+function classifyWater(image) {
+  var qa = image.select('QA60');
+  var cloudMask = qa.bitwiseAnd(1<<10).eq(0).and(qa.bitwiseAnd(1<<11).eq(0));
+  
+  var mndwi = image.normalizedDifference(['B3', 'B11']);
+  var water = mndwi.gt(0.1).rename('is_water'); // Binary 0/1
+  
+  return water.updateMask(cloudMask) // Only count clear pixels
+    .copyProperties(image, ['system:time_start']);
+}
+
+var waterCol = s2History.map(classifyWater);
+
+// Calculate Frequency
+var waterSum = waterCol.sum(); // How many times was it wet?
+var validCount = waterCol.count(); // How many times did we look (clear sky)?
+var frequency = waterSum.divide(validCount).multiply(100).rename('Flood_Frequency');
+
+// Classification (Sec 5.2 Interpretation)
+// > 80% = Permanent Water
+// 20% - 80% = Seasonal Water (Floodplain)
+// < 20% (but > 0%) = Ephemeral / Hazard Zones
+var hazardZones = frequency.updateMask(frequency.gt(0).and(frequency.lt(20)));
+var seasonalZones = frequency.updateMask(frequency.gte(20).and(frequency.lt(80)));
+
+// =========================================================
+// 5. VISUALIZATION
+// =========================================================
+
+Map.setOptions('HYBRID');
+
+// 1. Base: Pre-Event True Color
+Map.addLayer(s2Pre, {bands:['B4','B3','B2'], min:0, max:3000}, 'Pre-Event Context (Optical)', false);
+
+// 2. Risk Layers (Historical)
+// Seasonal = Light Blue, Hazard = Orange/Warning
+Map.addLayer(seasonalZones, {min:20, max:80, palette:['lightblue', 'blue']}, 'Seasonal Floodplain (Freq 20-80%)', false);
+Map.addLayer(hazardZones, {min:0, max:20, palette:['yellow', 'orange', 'red']}, 'Flood Hazard Risk (Freq < 20%)', false);
+
+// 3. Event Layers (Active Fusion)
+Map.addLayer(permWater, {palette:['000088']}, 'Permanent Water Bodies', true);
+Map.addLayer(actualFlood, {palette:['cyan']}, 'Active Flood Extent (S1 SAR)', true);
+
+// =========================================================
+// 6. UI LEGEND & STATS
+// =========================================================
+
+var panel = ui.Panel({
+  style: {position: 'bottom-right', padding: '8px', backgroundColor: 'rgba(255,255,255,0.9)'}
+});
+
+panel.add(ui.Label({value: 'Flood & Risk Monitor', style: {fontWeight: 'bold', fontSize: '16px'}}));
+panel.add(ui.Label({value: 'Sensor Fusion (S1 + S2)', style: {fontSize: '12px', color: 'gray'}}));
+
+function addRow(color, label) {
+  var box = ui.Label({style: {backgroundColor: color, padding: '8px', margin: '0 4px 4px 0'}});
+  var lbl = ui.Label({value: label, style: {margin: '0'}});
+  return ui.Panel({widgets: [box, lbl], layout: ui.Panel.Layout.Flow('horizontal')});
+}
+
+panel.add(ui.Label('Current Event Status:', {fontWeight:'bold', margin:'10px 0 5px 0'}));
+panel.add(addRow('cyan', 'Active Flood Inundation (SAR)'));
+panel.add(addRow('000088', 'Permanent Water (Baseline)'));
+
+panel.add(ui.Label('Historical Risk Profile:', {fontWeight:'bold', margin:'10px 0 5px 0'}));
+panel.add(addRow('orange', 'Hazard Zone (Rarely Floods)'));
+panel.add(addRow('lightblue', 'Seasonal Floodplain (Regular)'));
+
+Map.add(panel);
+
+// =========================================================
+// 7. EXPORTS
+// =========================================================
+
+// Export the active flood map
+Export.image.toDrive({
+  image: actualFlood,
+  description: 'S1_Active_Flood_Extent',
+  folder: 'GEE_Flood',
+  region: region,
+  scale: 10
+});
+
+// Export the frequency map for risk planning
+Export.image.toDrive({
+  image: frequency,
+  description: 'S2_Historical_Flood_Frequency',
+  folder: 'GEE_Flood',
+  region: region,
+  scale: 10
+});
