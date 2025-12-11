@@ -1,0 +1,245 @@
+/**
+ * @title Advanced Geological Suite: L9 + S2 + S1 Fusion
+ * @description Implements 3 advanced methodologies:
+ * 1. Critical Minerals in Veg (Feature Oriented PCA)
+ * 2. Volcanic Terrane Mapping (SVM/K-Means Classification)
+ * 3. Structural Mapping (Radar-Optical Fusion)
+ */
+
+// =========================================================
+// 0. CONFIGURATION & SETUP
+// =========================================================
+
+var config = {
+  start: '2022-01-01',
+  end: '2025-12-31',
+  cloudThresh: 15,
+  regionBuffer: 5000 // Meters
+};
+
+// Use geometry if available, otherwise default to a coordinate
+var point = typeof geometry !== 'undefined' ? geometry : ee.Geometry.Point([-6.0, 43.0]); // Default to N. Spain
+
+var region = point.buffer(config.regionBuffer).bounds();
+
+// =========================================================
+// 1. DATA PREPARATION
+// =========================================================
+
+// --- Landsat 9 (Regional Baseline) ---
+function prepL9(image) {
+  var optical = image.select('SR_B.').multiply(0.0000275).add(-0.2);
+  var thermal = image.select('ST_B.*').multiply(0.00341802).add(149.0);
+  
+  // Add Indices for Classification
+  var ndvi = image.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+  var swirRatio = image.select('SR_B6').divide(image.select('SR_B7')).rename('Clay_Ratio');
+  
+  return image.addBands(optical, null, true)
+              .addBands(thermal, null, true)
+              .addBands([ndvi, swirRatio]);
+}
+
+var l9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+  .filterBounds(region)
+  .filterDate(config.start, config.end)
+  .filter(ee.Filter.lt('CLOUD_COVER', config.cloudThresh))
+  .map(prepL9)
+  .median()
+  .clip(region);
+
+// --- Sentinel-2 (Targeting Outcrops) ---
+function prepS2(image) {
+  var qa = image.select('QA60');
+  var mask = qa.bitwiseAnd(1<<10).eq(0).and(qa.bitwiseAnd(1<<11).eq(0));
+  return image.updateMask(mask).divide(10000)
+    .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12']); // Select key bands
+}
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(region)
+  .filterDate(config.start, config.end)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', config.cloudThresh))
+  .map(prepS2)
+  .median()
+  .clip(region);
+
+// --- Sentinel-1 (Structural Radar) ---
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(region)
+  .filterDate(config.start, config.end)
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .select('VH')
+  .mean()
+  .clip(region);
+
+// Speckle Filtering for S1 (Refined Lee or simple boxcar for speed)
+var s1Filtered = s1.focal_mean(30, 'circle', 'meters').rename('Radar_Structure');
+
+// =========================================================
+// METHOD 1: FEATURE ORIENTED PCA (Vegetated Terrains)
+// =========================================================
+
+// Function to calculate PC bands
+function getPCA(image, bands, scale, prefix) {
+  var centered = image.select(bands).subtract(
+      image.select(bands).reduceRegion({
+        reducer: ee.Reducer.mean(), 
+        geometry: region, 
+        scale: scale, 
+        maxPixels: 1e9
+      }).toImage(bands)
+  );
+  
+  var covar = centered.toArray().reduceRegion({
+    reducer: ee.Reducer.covariance(),
+    geometry: region,
+    scale: scale,
+    maxPixels: 1e9
+  });
+  
+  var eigen = ee.Array(covar.get('array')).eigen();
+  var eigenVectors = eigen.slice(1, 1);
+  var principalComponents = ee.Image(eigenVectors).matrixMultiply(
+    centered.toArray().toArray(1)
+  );
+  
+  // FIXED: Added PC5 and PC6 to match the 6 input bands
+  var pcImage = principalComponents.arrayProject([0])
+    .arrayFlatten([[prefix+'_PC1', prefix+'_PC2', prefix+'_PC3', prefix+'_PC4', prefix+'_PC5', prefix+'_PC6']]);
+    
+  return pcImage;
+}
+
+// L9 PCA (Regional System)
+// Using standard Clay bands: Blue, Green, Red, NIR, SWIR1, SWIR2
+var l9Bands = ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7'];
+var l9PCA = getPCA(l9, l9Bands, 30, 'L9');
+
+// S2 PCA (Outcrop Targeting)
+var s2Bands = ['B2', 'B3', 'B4', 'B8', 'B11', 'B12'];
+var s2PCA = getPCA(s2, s2Bands, 20, 'S2');
+
+// Visualization for PCA
+// Usually PC1=Albedo, PC2=Veg, PC3/4=Alteration. 
+// We create a composite to show contrast.
+var pcaVis = {bands: ['L9_PC1', 'L9_PC2', 'L9_PC4'], min: -2, max: 2, gamma: 1.5};
+var s2PcaVis = {bands: ['S2_PC1', 'S2_PC2', 'S2_PC4'], min: -0.15, max: 0.15, gamma: 1.5};
+
+
+// =========================================================
+// METHOD 2: VOLCANIC MAPPING (SVM / Unsupervised)
+// =========================================================
+
+// Input bands for Classification (SWIR is critical for volcanics)
+var classBands = ['SR_B5', 'SR_B6', 'SR_B7', 'Clay_Ratio', 'NDVI'];
+var trainingImage = l9.select(classBands);
+
+// --- A. Unsupervised (K-Means) - Runs Automatically ---
+// Good for distinguishing Granite vs Volcanic if they are spectrally distinct
+var trainingSample = trainingImage.sample({
+  region: region,
+  scale: 30,
+  numPixels: 1000
+});
+
+var clusterer = ee.Clusterer.wekaKMeans(5).train(trainingSample);
+var unsupervisedResult = trainingImage.cluster(clusterer);
+
+var clusterVis = {min: 0, max: 4, palette: ['#ff0000', '#00ff00', '#0000ff', '#ffff00', '#ffffff']};
+
+// --- B. Supervised (SVM) - Template ---
+// Note: To use this, user must draw polygons and merge them into a FeatureCollection named 'trainingPolys'
+// with a property 'class'.
+/*
+var svmClassifier = ee.Classifier.libsvm({
+  kernelType: 'RBF',
+  gamma: 0.5,
+  cost: 10
+});
+
+// Mock code if training data existed:
+// var trainedSVM = svmClassifier.train(trainingPolys, 'class', classBands);
+// var svmResult = trainingImage.classify(trainedSVM);
+*/
+
+
+// =========================================================
+// METHOD 3: STRUCTURAL MAPPING (L9 + S1 FUSION)
+// =========================================================
+
+// Strategy: HSV Fusion
+// Hue = Landsat Geology (PC1/PC2/PC3 or RGB)
+// Saturation = Landsat Saturation
+// Value = Sentinel-1 Radar (Structure)
+
+// 1. Convert L9 to HSV
+var l9RGB = l9.select(['SR_B6', 'SR_B5', 'SR_B4']).visualize({min: 0.05, max: 0.4});
+var l9HSV = l9RGB.rgbToHsv(); 
+
+// 2. Normalize S1 Radar to 0-1 range for the 'Value' channel
+// VH backscatter typically -25 to -5 dB
+var s1Norm = s1Filtered.expression(
+  '(VH - min) / (max - min)', {
+    'VH': s1Filtered.select('Radar_Structure'), // FIXED: Changed 'VH' to 'Radar_Structure'
+    'min': -25,
+    'max': -5
+  }
+).clamp(0, 1);
+
+// 3. Fuse: Replace V with S1
+var fusedHSV = ee.Image.cat([
+  l9HSV.select('hue'),
+  l9HSV.select('saturation'), // Keep original saturation
+  s1Norm.rename('value')      // Inject Radar structure
+]);
+
+var fusedRGB = fusedHSV.hsvToRgb();
+
+
+// =========================================================
+// OUTPUTS & MAP
+// =========================================================
+
+Map.centerObject(region, 12);
+Map.setOptions('HYBRID');
+
+// Define Border
+var empty = ee.Image().byte();
+var outline = empty.paint({
+  featureCollection: ee.FeatureCollection(region),
+  color: 1,
+  width: 3
+});
+
+// --- Add Layers ---
+
+// Reference
+Map.addLayer(outline, {palette: 'white'}, 'ROI Boundary');
+
+// Method 1: PCA
+Map.addLayer(l9PCA, pcaVis, 'Critical Minerals L9', false);
+Map.addLayer(s2PCA, s2PcaVis, 'Critical Minerals S2', false);
+
+// Method 2: Classification
+Map.addLayer(unsupervisedResult, clusterVis, 'Volcanic Terrane Map', false);
+
+// Method 3: Structure Fusion
+Map.addLayer(s1Filtered, {min:-25, max:-5}, 'S1 Radar Raw', false);
+Map.addLayer(fusedRGB, {}, 'Structural Map', true);
+
+// Exports
+Export.image.toDrive({
+  image: fusedRGB,
+  description: 'L9_S1_Structure_Fusion',
+  scale: 30,
+  region: region
+});
+
+Export.image.toDrive({
+  image: s2PCA.select(['S2_PC1', 'S2_PC2', 'S2_PC3', 'S2_PC4']),
+  description: 'S2_Crosta_PCA',
+  scale: 10,
+  region: region
+});
