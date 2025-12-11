@@ -1,0 +1,215 @@
+/**
+ * @title Dynamic Landslide Risk: OPTRAM Soil Moisture & Susceptibility
+ * @description Implements Sec 6 of "Sentinel-2 Applications":
+ * 1. OPTRAM Model: High-Res Soil Moisture from S2 SWIR/NDVI (Sec 6.1)
+ * 2. Dynamic Risk: Fusion of Slope, Moisture, and Rainfall (Sec 6.2)
+ */
+
+// =========================================================
+// 1. CONFIGURATION
+// =========================================================
+
+var config = {
+  // Analysis Date: Choose a wet period (e.g., Monsoon season)
+  startDate: '2025-01-01',
+  endDate: '2025-12-31',
+  
+  // Cloud Threshold (Landslides often happen under clouds, so we compose)
+  cloudThresh: 20
+};
+
+// Default Region: High relief area (e.g., Himalayas/Andes)
+var point = typeof geometry !== 'undefined' ? geometry : ee.Geometry.Point([85.3, 27.9]); 
+var region = point.buffer(8000).bounds();
+Map.centerObject(region, 12);
+
+// =========================================================
+// 2. DATA INPUTS & PRE-PROCESSING
+// =========================================================
+
+// --- A. Sentinel-2 (Optical for OPTRAM) ---
+function prepS2(image) {
+  var qa = image.select('QA60');
+  var mask = qa.bitwiseAnd(1<<10).eq(0).and(qa.bitwiseAnd(1<<11).eq(0));
+  return image.updateMask(mask).divide(10000)
+    .copyProperties(image, ['system:time_start']);
+}
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(region)
+  .filterDate(config.startDate, config.endDate)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', config.cloudThresh))
+  .map(prepS2)
+  .median() // Create a cloud-free composite for the season
+  .clip(region);
+
+// --- B. DEM (Static Susceptibility) ---
+var dem = ee.Image('NASA/NASADEM_HGT/001').select('elevation').clip(region);
+var slope = ee.Terrain.slope(dem).rename('Slope');
+
+// --- C. Precipitation (Dynamic Trigger) ---
+// CHIRPS Pentad data (Rainfall in mm)
+var rainfall = ee.ImageCollection('UCSB-CHG/CHIRPS/PENTAD')
+  .filterBounds(region)
+  .filterDate(config.startDate, config.endDate)
+  .sum() // Total accumulated rainfall for the period
+  .clip(region)
+  .rename('Rainfall_Sum');
+
+// =========================================================
+// 3. THE OPTRAM MODEL (SECTION 6.1)
+// =========================================================
+
+// 1. Calculate Inputs: NDVI and STR
+// STR (Shortwave Infrared Transformed Reflectance) linearizes water content.
+// Formula: STR = (1 - SWIR)^2 / (2 * SWIR)
+// We use B12 (2190nm) as the SWIR band.
+
+var ndvi = s2.normalizedDifference(['B8', 'B4']).rename('NDVI');
+var swir = s2.select('B12');
+
+var str = swir.expression(
+  'pow((1 - b(0)), 2) / (2 * b(0))',
+  [swir]
+).rename('STR');
+
+// 2. Define Wet and Dry Edges (The Trapezoid)
+// In a full automated script, we would bin NDVI and regress percentiles.
+// For this runnable demo, we use robust statistics (percentiles) of the whole scene
+// to estimate the trapezoid boundaries dynamically.
+
+var stats = str.addBands(ndvi).reduceRegion({
+  reducer: ee.Reducer.percentile([5, 95]), // 5% = Wet Edge approx, 95% = Dry Edge approx
+  geometry: region,
+  scale: 100, // Coarser scale for statistics to save memory
+  maxPixels: 1e9
+});
+
+// We simplify the trapezoid to a rectangle for stability in this demo 
+// (or assume flat edges if regression isn't performed).
+// Real OPTRAM: Edge = intercept + slope * NDVI
+// Simplified: Dry = Max STR, Wet = Min STR
+var strDry = ee.Number(stats.get('STR_p95'));
+var strWet = ee.Number(stats.get('STR_p5'));
+
+// 3. Calculate Soil Moisture (W)
+// W = (STR - STR_dry) / (STR_wet - STR_dry)
+// Note: Denominator is negative (Wet < Dry usually in reflectance, but STR inverts this?)
+// Let's stick to the physical normalization:
+// Relative Saturation = (Current - Dry) / (Wet - Dry)
+
+var optramMoisture = str.subtract(strDry).divide(strWet.subtract(strDry))
+  .clamp(0, 1) // Force 0-1 range
+  .rename('OPTRAM_Moisture');
+
+// =========================================================
+// 4. DYNAMIC SUSCEPTIBILITY MODELING (SECTION 6.2)
+// =========================================================
+
+// We fuse Static Factors (Slope) with Dynamic Factors (Moisture + Rain)
+
+// 1. Normalize Inputs (0-1 Scale)
+var slopeNorm = slope.divide(60).clamp(0, 1); // Normalize slope up to 60 degrees
+var rainNorm = rainfall.divide(1000).clamp(0, 1); // Normalize rain up to 1000mm
+
+// 2. Susceptibility Equation
+// A heuristic weighted sum based on common landslide physics:
+// Risk = (Slope * 0.4) + (Soil_Moisture * 0.4) + (Rainfall * 0.2)
+// Logic: Steep slopes + Saturated Soil = Failure. Rain adds immediate trigger.
+
+var dynamicRisk = slopeNorm.multiply(0.4)
+  .add(optramMoisture.multiply(0.4))
+  .add(rainNorm.multiply(0.2))
+  .rename('Dynamic_Landslide_Risk');
+
+// 3. Mask Safe Areas
+// Flat areas (Slope < 10) are generally safe regardless of rain
+var riskMasked = dynamicRisk.updateMask(slope.gt(10));
+
+// =========================================================
+// 5. VISUALIZATION
+// =========================================================
+
+Map.setOptions('HYBRID');
+
+// Layer 1: OPTRAM Soil Moisture
+var moistureVis = {
+  min: 0, 
+  max: 1, 
+  palette: ['brown', 'yellow', 'blue'] // Dry -> Wet
+};
+
+// Layer 2: Dynamic Landslide Risk
+var riskVis = {
+  min: 0.2, 
+  max: 0.8, 
+  palette: ['green', 'yellow', 'orange', 'red', 'darkred'] // Safe -> Danger
+};
+
+// Layer 3: Rainfall (Context)
+var rainVis = {min: 0, max: 800, palette: ['white', 'blue', 'darkblue']};
+
+Map.addLayer(rainfall, rainVis, 'Accumulated Rainfall (Context)', false);
+Map.addLayer(optramMoisture, moistureVis, 'OPTRAM Soil Moisture (Sat)', false);
+Map.addLayer(riskMasked, riskVis, 'Dynamic Landslide Risk (Final)');
+
+// =========================================================
+// 6. UI LEGEND
+// =========================================================
+
+var panel = ui.Panel({
+  style: {position: 'bottom-left', padding: '8px', backgroundColor: 'rgba(255,255,255,0.9)'}
+});
+
+panel.add(ui.Label({value: 'Dynamic Slope Stability', style: {fontWeight: 'bold', fontSize: '16px'}}));
+
+// Risk Legend
+panel.add(ui.Label('Landslide Hazard Probability', {margin: '10px 0 0 0'}));
+var riskBar = ui.Thumbnail({
+  image: ee.Image.pixelLonLat().select(0),
+  params: {
+    bbox: [0, 0, 1, 0.1],
+    dimensions: '100x10',
+    format: 'png',
+    min: 0, max: 1,
+    palette: riskVis.palette,
+  },
+  style: {stretch: 'horizontal', margin: '0px 8px', maxHeight: '24px'},
+});
+panel.add(riskBar);
+panel.add(ui.Panel({
+  widgets: [ui.Label('Low Risk'), ui.Label('High Risk')],
+  layout: ui.Panel.Layout.Flow('horizontal', true),
+  style: {stretch: 'horizontal', margin: '0px 8px'}
+}));
+
+// Components Legend
+panel.add(ui.Label('Model Components:', {fontWeight: 'bold', margin: '10px 0 5px 0'}));
+function addRow(name, val) {
+  return ui.Label({value: '• ' + name, style: {fontSize: '12px', color: 'gray'}});
+}
+panel.add(addRow('Static: Slope (DEM)'));
+panel.add(addRow('Dynamic: OPTRAM Moisture (Sentinel-2)'));
+panel.add(addRow('Trigger: Rainfall (CHIRPS)'));
+
+Map.add(panel);
+
+// =========================================================
+// 7. EXPORTS
+// =========================================================
+
+Export.image.toDrive({
+  image: optramMoisture,
+  description: 'OPTRAM_Soil_Moisture',
+  folder: 'GEE_Landslide',
+  region: region,
+  scale: 20
+});
+
+Export.image.toDrive({
+  image: riskMasked,
+  description: 'Dynamic_Landslide_Risk_Map',
+  folder: 'GEE_Landslide',
+  region: region,
+  scale: 20
+});
