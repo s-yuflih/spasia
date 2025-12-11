@@ -1,0 +1,215 @@
+/**
+ * @title Carbon Monitoring: Biomass (AGB) & Soil Organic Carbon (SOC)
+ * @description Implements Sec 4 of "Sentinel-2 Applications":
+ * 1. AGB: Sensor Fusion (S2 Optical + S1 Radar) + GEDI Logic (Sec 4.1)
+ * 2. SOC: Bare Soil Compositing & Indexing (Sec 4.2)
+ */
+
+// =========================================================
+// 1. CONFIGURATION
+// =========================================================
+
+var config = {
+  start: '2022-01-01',
+  end: '2024-12-31',
+  cloudThresh: 60 // High threshold allowed; we filter pixels later
+};
+
+// Default Region: A mix of forest and agriculture (e.g., Central France or Brazil)
+// If user draws a geometry, use it.
+var point = typeof geometry !== 'undefined' ? geometry : ee.Geometry.Point([-0.6, 44.8]); 
+var region = point.buffer(10000).bounds();
+Map.centerObject(region, 12);
+
+// =========================================================
+// 2. DATA PREPARATION (SENSOR FUSION)
+// =========================================================
+
+// --- A. Sentinel-2 (Optical Phenology & Texture) ---
+function prepS2(image) {
+  var qa = image.select('QA60');
+  var mask = qa.bitwiseAnd(1<<10).eq(0).and(qa.bitwiseAnd(1<<11).eq(0));
+  var img = image.updateMask(mask).divide(10000);
+
+  // Indices for Biomass (Sec 4.1.1)
+  var ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  // Red-Edge Index (Correlation with LAI)
+  var reip = img.expression(
+    '700 + 40 * (( (B4 + B7)/2 - B5) / (B6 - B5) )', {
+      'B4': img.select('B4'), 'B5': img.select('B5'), 
+      'B6': img.select('B6'), 'B7': img.select('B7')
+  }).rename('REIP');
+
+  // Indices for Soil (Sec 4.2.1)
+  // Bare Soil Index (BSI)
+  var bsi = img.expression(
+    '((B11 + B4) - (B8 + B2)) / ((B11 + B4) + (B8 + B2))', {
+      'B11': img.select('B11'), 'B4': img.select('B4'),
+      'B8': img.select('B8'),  'B2': img.select('B2')
+    }
+  ).rename('BSI');
+
+  return img.addBands([ndvi, reip, bsi])
+            .copyProperties(image, ['system:time_start']);
+}
+
+var s2Col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(region)
+  .filterDate(config.start, config.end)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', config.cloudThresh))
+  .map(prepS2);
+
+// --- B. Sentinel-1 (SAR Structure for Biomass) ---
+// S1 C-band backscatter correlates with volume/roughness (Sec 4.1.1)
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(region)
+  .filterDate(config.start, config.end)
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .select(['VV', 'VH'])
+  .median() // Reduce to a single composite
+  .clip(region);
+
+// --- C. Create the Fusion Stack ---
+var s2Median = s2Col.median().clip(region);
+var fusionStack = s2Median.addBands(s1);
+
+// =========================================================
+// 3. ABOVE-GROUND BIOMASS (AGB) - SEC 4.1
+// =========================================================
+
+// Note: Real workflow uses GEDI L2A footprints as training points.
+// Here we SIMULATE the training data based on the logic that
+// Biomass ~ f(Radar Volume + Optical Density) to make the script runnable.
+
+// 1. Generate Synthetic Training Data
+var samplePoints = fusionStack.sample({
+  region: region,
+  scale: 30,
+  numPixels: 500,
+  geometries: true
+});
+
+var trainingData = samplePoints.map(function(feat) {
+  // Synthetic Biomass Model (Mg/ha)
+  // Logic: High Backscatter (VH) + High Vegetation (NDVI/REIP) = High Biomass
+  var vh = feat.getNumber('VH'); // typically -25 to -10
+  var ndvi = feat.getNumber('NDVI');
+  
+  // AGB Proxy formula
+  var agb = vh.add(25).multiply(10).add(ndvi.multiply(100));
+  return feat.set('AGB_Target', agb.max(0)); // Ensure non-negative
+});
+
+// 2. Train Random Forest (Fusion Model)
+var predictors = ['VH', 'VV', 'B4', 'B8', 'B11', 'NDVI', 'REIP'];
+var rfAGB = ee.Classifier.smileRandomForest(100)
+  .setOutputMode('REGRESSION')
+  .train({
+    features: trainingData,
+    classProperty: 'AGB_Target',
+    inputProperties: predictors
+  });
+
+// 3. Predict AGB Map
+var agbMap = fusionStack.select(predictors).classify(rfAGB).rename('Predicted_AGB');
+
+// =========================================================
+// 4. SOIL ORGANIC CARBON (SOC) - SEC 4.2
+// =========================================================
+
+// Logic: Create a "Bare Soil Composite" by finding pixels where
+// NDVI is low AND BSI is high over the entire time range (Sec 4.2.1)
+
+// 1. Define Bare Soil Condition
+function maskVegetation(img) {
+  var ndvi = img.select('NDVI');
+  var bsi = img.select('BSI');
+  
+  // Thresholds from document: NDVI < 0.25, BSI > 0.08
+  var bareCondition = ndvi.lt(0.25).and(bsi.gt(0.05)); 
+  return img.updateMask(bareCondition);
+}
+
+// 2. Generate Bare Soil Composite (Temporal Reducer)
+// This "stitches" together bare moments (ploughing times) for every pixel
+var bareSoilComposite = s2Col.map(maskVegetation).median().clip(region);
+
+// 3. SOC Modeling (Simulated)
+// Darker soils (low albedo) in SWIR/Red often indicate higher SOC (Sec 4.2.2)
+// SOC ~ Inverse of Brightness
+var socMap = bareSoilComposite.expression(
+  '45 - (100 * (B4 + B11) / 2)', { // Simple inverse brightness proxy
+    'B4': bareSoilComposite.select('B4'),
+    'B11': bareSoilComposite.select('B11')
+}).rename('Predicted_SOC');
+
+// =========================================================
+// 5. VISUALIZATION & OUTPUTS
+// =========================================================
+
+Map.setOptions('HYBRID');
+
+// AGB Vis
+var agbVis = {min: 0, max: 250, palette: ['f7fcb9', 'addd8e', '31a354', '004529']}; // Light Green -> Dark Green
+
+// SOC Vis
+var socVis = {min: 10, max: 40, palette: ['ffffe5', 'f7fcb9', 'd9f0a3', '78c679', '41ab5d', '238443', '005a32']};
+
+// 1. Fusion Inputs
+Map.addLayer(s1.select('VH'), {min:-25, max:-5}, 'Sentinel-1 VH (Structure)', false);
+
+// 2. AGB Result
+Map.addLayer(agbMap, agbVis, 'Est. Above-Ground Biomass (Mg/ha)');
+
+// 3. Bare Soil Composite (The "Ghost" Image)
+// This shows what the land looks like without plants
+Map.addLayer(bareSoilComposite, {bands:['B4','B3','B2'], min:0, max:0.3}, 'Bare Soil Composite (True Color)', false);
+
+// 4. SOC Result
+Map.addLayer(socMap, socVis, 'Est. Soil Organic Carbon (SOC)', false);
+
+
+// =========================================================
+// 6. UI LEGEND
+// =========================================================
+
+var panel = ui.Panel({
+  style: {position: 'bottom-right', padding: '8px', backgroundColor: 'rgba(255,255,255,0.9)'}
+});
+
+panel.add(ui.Label({value: 'Carbon Monitoring', style: {fontWeight: 'bold', fontSize: '16px'}}));
+
+// AGB Legend
+panel.add(ui.Label('AGB (Biomass) Mg/ha'));
+var agbImg = ui.Thumbnail({image: ee.Image.pixelLonLat().select(0), params: {bbox:[0,0,1,0.1], dimensions:'100x10', min:0, max:1, palette: agbVis.palette}, style: {stretch: 'horizontal', margin: '0 8px'}});
+panel.add(agbImg);
+panel.add(ui.Label('0 (Low) ------------------ 250+ (High)', {fontSize:'10px', margin:'0 8px'}));
+
+// SOC Legend
+panel.add(ui.Label('SOC (Soil Carbon) Index', {margin: '10px 0 0 0'}));
+var socImg = ui.Thumbnail({image: ee.Image.pixelLonLat().select(0), params: {bbox:[0,0,1,0.1], dimensions:'100x10', min:0, max:1, palette: socVis.palette}, style: {stretch: 'horizontal', margin: '0 8px'}});
+panel.add(socImg);
+panel.add(ui.Label('Low Organic ---------------- High Humus', {fontSize:'10px', margin:'0 8px'}));
+
+Map.add(panel);
+
+// =========================================================
+// 7. EXPORTS
+// =========================================================
+
+Export.image.toDrive({
+  image: agbMap,
+  description: 'S2_S1_AGB_Map',
+  folder: 'GEE_Carbon',
+  region: region,
+  scale: 20
+});
+
+Export.image.toDrive({
+  image: bareSoilComposite.select(['B2','B3','B4','B8','B11','B12']),
+  description: 'S2_BareSoil_Composite',
+  folder: 'GEE_Carbon',
+  region: region,
+  scale: 10
+});
