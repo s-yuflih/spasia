@@ -1,4 +1,4 @@
-scars_feature = ee.FeatureCollection([ee.Feature(
+scars_feature = [ee.Feature(
             ee.Geometry.Polygon(
                 [[[120.80808359207889, 22.56416936933637],
                   [120.80782610001346, 22.56547715940785],
@@ -340,4 +340,4 @@ scars_feature = ee.FeatureCollection([ee.Feature(
             {
               "class": 0,
               "system:index": "7"
-            })]);
+            })]
